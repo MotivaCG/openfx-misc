@@ -70,6 +70,11 @@
  
  */
 
+/*
+ TODO:
+ implement most methods.
+ */
+
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -89,7 +94,8 @@
 "- Discard: Only display one of the half-pictures, discard the other. Other name: \"single field\". Both temporal and vertical spatial resolutions are halved. Can be used for slower computers or to give interlaced video movie-like look with characteristic judder.\n" \
 "- Linear: Doubler. Bob with linear interpolation: instead of displaying each line twice, line 2 is created as the average of line 1 and 3, etc.\n" \
 "- Mean: Blender (half resolution). Display a half-picture that is created as the average of the two original half-pictures.\n" \
-"- Yadif: Interpolator (Yet Another DeInterlacing Filter) from MPlayer by Michael Niedermayer (http://www.mplayerhq.hu). It checks pixels of previous, current and next frames to re-create the missed field by some local adaptive method (edge-directed interpolation) and uses spatial check to prevent most artifacts." \
+"- Yadif: Interpolator (Yet Another DeInterlacing Filter) from MPlayer by Michael Niedermayer (http://www.mplayerhq.hu). It checks pixels of previous, current and next frames to re-create the missed field by some local adaptive method (edge-directed interpolation) and uses spatial check to prevent most artifacts.\n" \
+"- W3F: Martin Weston three field deinterlace, as described in BBC patent <https://www.google.com/patents/US4789893>. These filters use three consecutive fields to compute each interpolated line. The simple filter is described in Fig. 3, and the complex filter is described in Fig. 5 in the patent."
 
 #define kPluginIdentifier    "net.sf.openfx.Deinterlace"
 #define kPluginVersionMajor 1 // Incrementing this number means that you have broken backwards compatibility of the plug-in.
@@ -97,7 +103,7 @@
 
 #define kSupportsTiles 0
 #define kSupportsMultiResolution 0
-#define kSupportsRenderScale 1 // are images still fielded at any renderscale?
+#define kSupportsRenderScale 0 // are images still fielded at any renderscale?
 #define kRenderThreadSafety eRenderFullySafe
 
 #define kParamMode "mode"
@@ -116,7 +122,9 @@
 #define kParamModeOptionMean "Mean"
 #define kParamModeOptionMeanHint "Blender (half resolution). Display a half-picture that is created as the average of the two original half-pictures."
 #define kParamModeOptionYadif "Yadif"
-#define kParamModeOptionYadifHint "Interpolator (Yet Another DeInterlacing Filter) from MPlayer by Michael Niedermayer (http://www.mplayerhq.hu). It checks pixels of previous, current and next frames to re-create the missed field by some local adaptive method (edge-directed interpolation) and uses spatial check to prevent most artifacts."
+#define kParamModeOptionYadifHint "Interpolator (Yet Another DeInterlacing Filter) from MPlayer by Michael Niedermayer <http://www.mplayerhq.hu>. It checks pixels of previous, current and next frames to re-create the missed field by some local adaptive method (edge-directed interpolation) and uses spatial check to prevent most artifacts."
+#define kParamModeOptionW3F "W3F"
+#define kParamModeOptionW3FHint "Martin Weston three field deinterlace, as described in BBC patent <https://www.google.com/patents/US4789893>. These filters use three consecutive fields to compute each interpolated line. The simple filter is described in Fig. 3 in the patent. The complex filter is described in Fig. 5 in the patent."
 
 enum DeinterlaceModeEnum {
     eDeinterlaceModeWeave,
@@ -126,30 +134,23 @@ enum DeinterlaceModeEnum {
     eDeinterlaceModeLinear,
     eDeinterlaceModeMean,
     eDeinterlaceModeYadif,
+    eDeinterlaceModeW3F,
 };
 
 #define kParamFieldOrder "fieldOrder"
 #define kParamFieldOrderLabel "Field Order"
 #define kParamFieldOrderHint "Interlaced field order"
 #define kParamFieldOrderOptionLower "Lower field first"
+#define kParamFieldOrderOptionLowerHint "Lower/bottom field first"
 #define kParamFieldOrderOptionUpper "Upper field first"
-#define kParamFieldOrderOptionAuto "HD=upper,SD=lower"
+#define kParamFieldOrderOptionUpperHint "Upper/top field first"
+#define kParamFieldOrderOptionAuto "Auto"
+#define kParamFieldOrderOptionAutoHint "HD=upper,SD=lower"
 
 enum FieldOrderEnum {
     eFieldOrderLower,
     eFieldOrderUpper,
     eFieldOrderAuto,
-};
-
-#define kParamParity "parity"
-#define kParamParityLabel "Parity"
-#define kParamParityHint "Interpolate which field"
-#define kParamParityOptionLower "Lower"
-#define kParamParityOptionUpper "Upper"
-
-enum ParityEnum {
-    eParityLower,
-    eParityUpper,
 };
 
 #define kParamDoubleFramerate "doubleFramerate"
@@ -169,7 +170,20 @@ enum YadifModeEnum {
     eYadifModeTemporal,
 };
 
-class DeinterlacePlugin : public OFX::ImageEffect 
+#define kParamW3FFilter "w3fFilter"
+#define kParamW3FFilterLabel "W3F Filter"
+#define kParamW3FFilterHint "Specify the filter. "
+#define kParamW3FFilterOptionSimple "Simple"
+#define kParamW3FFilterOptionSimpleHint "The simple filter is described in Fig. 3 in the patent."
+#define kParamW3FFilterOptionComplex "Complex"
+#define kParamW3FFilterOptionComplexHint "The complex filter is described in Fig. 5 in the patent."
+
+enum W3FFilterEnum {
+    eW3FFilterSimple,
+    eW3FFilterComplex,
+};
+
+class DeinterlacePlugin : public OFX::ImageEffect
 {
 public:
     DeinterlacePlugin(OfxImageEffectHandle handle) : ImageEffect(handle), dstClip_(0), srcClip_(0)
@@ -177,9 +191,12 @@ public:
         dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
         srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
 
-        mode = fetchChoiceParam("mode");
-        fieldOrder = fetchChoiceParam("fieldOrder");
-        parity = fetchChoiceParam("parity");
+        _mode = fetchChoiceParam(kParamMode);
+        _fieldOrder = fetchChoiceParam(kParamFieldOrder);
+        _yadifMode = fetchChoiceParam(kParamYadifMode);
+        _w3fFilter = fetchChoiceParam(kParamW3FFilter);
+        _doubleFramerate = fetchBooleanParam(kParamDoubleFramerate);
+        assert(_mode && _fieldOrder && _yadifMode && _w3fFilter && _doubleFramerate);
     }
 
 private:
@@ -193,19 +210,26 @@ private:
 
     /* override is identity */
     virtual bool isIdentity(const OFX::IsIdentityArguments &args, OFX::Clip * &identityClip, double &identityTime) OVERRIDE FINAL;
+
+    virtual bool getTimeDomain(OfxRangeD &range) OVERRIDE FINAL;
+
 private:
     // do not need to delete these, the ImageEffect is managing them for us
     OFX::Clip *dstClip_;
     OFX::Clip *srcClip_;
 
-    OFX::ChoiceParam *fieldOrder, *mode, *parity;
-    
+    OFX::ChoiceParam *_mode;
+    OFX::ChoiceParam *_fieldOrder;
+    OFX::ChoiceParam *_yadifMode;
+    OFX::ChoiceParam *_w3fFilter;
+    OFX::BooleanParam *_doubleFramerate;
+
 };
 
 
 
 // =========== GNU Lesser General Public License code start =================
-
+namespace Yadif {
 // Yadif (yet another deinterlacing filter)
 // http://avisynth.org.ru/yadif/yadif.html
 // http://mplayerhq.hu
@@ -423,47 +447,26 @@ static void filter_plane_ofx(int mode,
 
 // =========== GNU Lesser General Public License code end =================
 
-void DeinterlacePlugin::render(const OFX::RenderArguments &args)
+void deinterlace(const OFX::Image* srcp, const OFX::Image* src, const OFX::Image* srcn,
+                 FieldOrderEnum fieldOrder, int field,
+                 YadifModeEnum yadifMode,
+                 OFX::Image* dst)
 {
-    if (!kSupportsRenderScale && (args.renderScale.x != 1. || args.renderScale.y != 1.)) {
-        OFX::throwSuiteStatusException(kOfxStatFailed);
+    int imode;
+    switch (yadifMode) {
+        case eYadifModeTemporalSpatial:
+            imode = 0;
+            break;
+        case eYadifModeTemporal:
+            imode = 2;
     }
 
-    OFX::BitDepthEnum       dstBitDepth    = dstClip_->getPixelDepth();
-    OFX::PixelComponentEnum dstComponents  = dstClip_->getPixelComponents();
-
-    std::auto_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
-
-    std::auto_ptr<const OFX::Image> src(srcClip_->fetchImage(args.time)),
-                              srcp(srcClip_->fetchImage(args.time-1.0)),
-                              srcn(srcClip_->fetchImage(args.time+1.0));
-    if (!src.get() || !dst.get() || !srcp.get() || !srcn.get()) {
-        OFX::throwSuiteStatusException(kOfxStatFailed);
-    }
-    
+    OFX::PixelComponentEnum dstComponents  = dst->getPixelComponents();
+    OFX::BitDepthEnum       dstBitDepth    = dst->getPixelDepth();
     const OfxRectI rect = dst->getBounds();
 
-    int width=rect.x2-rect.x1;
-    int height=rect.y2-rect.y1;
-
-    int imode       = 0;
-    int ifieldOrder = 2;
-    int iparity     = 0;
-
-    mode->getValueAtTime(args.time,imode);
-    fieldOrder->getValueAtTime(args.time,ifieldOrder);
-    parity->getValueAtTime(args.time,iparity);
-
-    imode*=2;
-
-    if (ifieldOrder==2) {
-        if (width>1024) {
-            ifieldOrder=1;
-        } else {
-            ifieldOrder=0;
-        }
-    }
-
+    int width = rect.x2 - rect.x1;
+    int height = rect.y2 - rect.y1;
 
     if (width < 3 || height < 3) {
         // Video of less than 3 columns or lines is not supported
@@ -472,53 +475,71 @@ void DeinterlacePlugin::render(const OFX::RenderArguments &args)
             memcpy(dst->getPixelAddress(0,y),src->getPixelAddress(0,y),abs(src->getRowBytes()));
         }
     } else {
+        int ifieldOrder;
+        switch(fieldOrder) {
+            case eFieldOrderLower:
+                ifieldOrder = 0;
+                break;
+            case eFieldOrderUpper:
+                ifieldOrder = 1;
+                break;
+            case eFieldOrderAuto:
+                if (width > 1024) {
+                    ifieldOrder = 1;
+                } else {
+                    ifieldOrder = 0;
+                }
+                break;
+        }
+        int parity = ifieldOrder ^ !field; // automatic parity setting
+
         if (dstComponents == OFX::ePixelComponentRGBA) {
             switch(dstBitDepth) {
-            case OFX::eBitDepthUByte:
-                filter_plane_ofx<4,unsigned char,int>(imode, // mode
-                                                      dst.get(),
-                                                      srcp.get(), src.get(), srcn.get(),
-                                                      iparity,ifieldOrder); // parity, tff
-                break;
-
-            case OFX::eBitDepthUShort:
-                filter_plane_ofx<4,unsigned short,int>(imode, // mode
-                                                       dst.get(),
-                                                       srcp.get(), src.get(), srcn.get(),
-                                                       iparity,ifieldOrder); // parity, tff
-                    break;
-                    
-            case OFX::eBitDepthFloat:
-                    filter_plane_ofx<4,float,float>(imode, // mode
-                                                    dst.get(),
-                                                    srcp.get(), src.get(), srcn.get(),
-                                                    iparity,ifieldOrder); // parity, tff
+                case OFX::eBitDepthUByte:
+                    Yadif::filter_plane_ofx<4,unsigned char,int>(imode, // mode
+                                                                 dst,
+                                                                 srcp, src, srcn,
+                                                                 parity, ifieldOrder); // parity, tff
                     break;
 
-            default:
-                break;
+                case OFX::eBitDepthUShort:
+                    Yadif::filter_plane_ofx<4,unsigned short,int>(imode, // mode
+                                                                  dst,
+                                                                  srcp, src, srcn,
+                                                                  parity, ifieldOrder); // parity, tff
+                    break;
+
+                case OFX::eBitDepthFloat:
+                    Yadif::filter_plane_ofx<4,float,float>(imode, // mode
+                                                           dst,
+                                                           srcp, src, srcn,
+                                                           parity, ifieldOrder); // parity, tff
+                    break;
+
+                default:
+                    break;
             }
         } else if (dstComponents == OFX::ePixelComponentRGB) {
             switch(dstBitDepth) {
                 case OFX::eBitDepthUByte:
-                    filter_plane_ofx<3,unsigned char,int>(imode, // mode
-                                                          dst.get(),
-                                                          srcp.get(), src.get(), srcn.get(),
-                                                          iparity,ifieldOrder); // parity, tff
+                    Yadif::filter_plane_ofx<3,unsigned char,int>(imode, // mode
+                                                                 dst,
+                                                                 srcp, src, srcn,
+                                                                 parity, ifieldOrder); // parity, tff
                     break;
 
                 case OFX::eBitDepthUShort:
-                    filter_plane_ofx<3,unsigned short,int>(imode, // mode
-                                                           dst.get(),
-                                                           srcp.get(), src.get(), srcn.get(),
-                                                           iparity,ifieldOrder); // parity, tff
+                    Yadif::filter_plane_ofx<3,unsigned short,int>(imode, // mode
+                                                                  dst,
+                                                                  srcp, src, srcn,
+                                                                  parity, ifieldOrder); // parity, tff
                     break;
 
                 case OFX::eBitDepthFloat:
-                    filter_plane_ofx<3,float,float>(imode, // mode
-                                                    dst.get(),
-                                                    srcp.get(), src.get(), srcn.get(),
-                                                    iparity,ifieldOrder); // parity, tff
+                    Yadif::filter_plane_ofx<3,float,float>(imode, // mode
+                                                           dst,
+                                                           srcp, src, srcn,
+                                                           parity, ifieldOrder); // parity, tff
                     break;
 
                 default:
@@ -526,31 +547,117 @@ void DeinterlacePlugin::render(const OFX::RenderArguments &args)
             }
         } else if (dstComponents == OFX::ePixelComponentAlpha) {
             switch(dstBitDepth) {
-            case OFX::eBitDepthUByte:
-                    filter_plane_ofx<1,unsigned char,int>(imode, // mode
-                                                          dst.get(),
-                                                          srcp.get(), src.get(), srcn.get(),
-                                                          iparity,ifieldOrder); // parity, tff
+                case OFX::eBitDepthUByte:
+                    Yadif::filter_plane_ofx<1,unsigned char,int>(imode, // mode
+                                                                 dst,
+                                                                 srcp, src, srcn,
+                                                                 parity, ifieldOrder); // parity, tff
                     break;
 
-            case OFX::eBitDepthUShort:
-                    filter_plane_ofx<1,unsigned short,int>(imode, // mode
-                                                           dst.get(),
-                                                           srcp.get(), src.get(), srcn.get(),
-                                                           iparity,ifieldOrder); // parity, tff
+                case OFX::eBitDepthUShort:
+                    Yadif::filter_plane_ofx<1,unsigned short,int>(imode, // mode
+                                                                  dst,
+                                                                  srcp, src, srcn,
+                                                                  parity, ifieldOrder); // parity, tff
                     break;
 
-            case OFX::eBitDepthFloat:
-                    filter_plane_ofx<1,float,float>(imode, // mode
-                                                    dst.get(),
-                                                    srcp.get(), src.get(), srcn.get(),
-                                                    iparity,ifieldOrder); // parity, tff
+                case OFX::eBitDepthFloat:
+                    Yadif::filter_plane_ofx<1,float,float>(imode, // mode
+                                                           dst,
+                                                           srcp, src, srcn,
+                                                           parity, ifieldOrder); // parity, tff
                     break;
 
-            default:
-                break;
+                default:
+                    break;
             }
         }
+    }
+}
+
+} // namespace Yadif
+
+void DeinterlacePlugin::render(const OFX::RenderArguments &args)
+{
+    if (!kSupportsRenderScale && (args.renderScale.x != 1. || args.renderScale.y != 1.)) {
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+
+    const double dstTime = args.time;
+
+    bool doubleFramerate;
+    _doubleFramerate->getValueAtTime(dstTime, doubleFramerate);
+
+    const double srcTime = doubleFramerate ? std::floor(dstTime / 2. + 0.5) : dstTime;
+
+    std::auto_ptr<OFX::Image> dst(dstClip_->fetchImage(dstTime));
+    std::auto_ptr<const OFX::Image> src(srcClip_->fetchImage(srcTime));
+    if (!src.get() || !dst.get()) {
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+
+    const OfxRectI& srcBounds = src->getBounds();
+    const OfxRectI& srcRod = src->getRegionOfDefinition();
+    const OfxRectI& dstBounds = dst->getBounds();
+    const OfxRectI& dstRod= dst->getRegionOfDefinition();
+
+    if (!kSupportsTiles) {
+        // http://openfx.sourceforge.net/Documentation/1.3/ofxProgrammingReference.html#kOfxImageEffectPropSupportsTiles
+        //  If a clip or plugin does not support tiled images, then the host should supply full RoD images to the effect whenever it fetches one.
+        assert(srcRod.x1 == srcBounds.x1);
+        assert(srcRod.x2 == srcBounds.x2);
+        assert(srcRod.y1 == srcBounds.y1);
+        assert(srcRod.y2 == srcBounds.y2); // crashes on Natron if kSupportsTiles=0 & kSupportsMultiResolution=1
+        assert(dstRod.x1 == dstBounds.x1);
+        assert(dstRod.x2 == dstBounds.x2);
+        assert(dstRod.y1 == dstBounds.y1);
+        assert(dstRod.y2 == dstBounds.y2); // crashes on Natron if kSupportsTiles=0 & kSupportsMultiResolution=1
+    }
+    if (!kSupportsMultiResolution) {
+        // http://openfx.sourceforge.net/Documentation/1.3/ofxProgrammingReference.html#kOfxImageEffectPropSupportsMultiResolution
+        //   Multiple resolution images mean...
+        //    input and output images can be of any size
+        //    input and output images can be offset from the origin
+        assert(srcRod.x1 == 0);
+        assert(srcRod.y1 == 0);
+        assert(srcRod.x1 == dstRod.x1);
+        assert(srcRod.x2 == dstRod.x2);
+        assert(srcRod.y1 == dstRod.y1);
+        assert(srcRod.y2 == dstRod.y2); // crashes on Natron if kSupportsMultiResolution=0
+    }
+
+
+    int mode_i;
+    int fieldOrder_i;
+
+    _mode->getValueAtTime(dstTime, mode_i);
+    DeinterlaceModeEnum mode = (DeinterlaceModeEnum)mode_i;
+    _fieldOrder->getValueAtTime(dstTime, fieldOrder_i);
+    FieldOrderEnum fieldOrder = (FieldOrderEnum)fieldOrder_i;
+
+    int field = doubleFramerate ? ((int)dstTime & 1) : 0;
+
+    switch (mode) {
+        case eDeinterlaceModeYadif: {
+            std::auto_ptr<OFX::Image> srcp(srcClip_->fetchImage(srcTime-1.0));
+            std::auto_ptr<OFX::Image> srcn(srcClip_->fetchImage(srcTime+1.0));
+
+            if (!srcp.get() || !srcn.get()) {
+                OFX::throwSuiteStatusException(kOfxStatFailed);
+            }
+
+            int yadifMode_i;
+            _yadifMode->getValueAtTime(dstTime, yadifMode_i);
+            YadifModeEnum yadifMode = (YadifModeEnum)yadifMode_i;
+
+            Yadif::deinterlace(srcp.get(), src.get(), srcn.get(),
+                               fieldOrder, field,
+                               yadifMode,
+                               dst.get());
+        }
+            break;
+        default:
+            OFX::throwSuiteStatusException(kOfxStatFailed);
     }
 }
 
@@ -560,6 +667,12 @@ DeinterlacePlugin::getClipPreferences(OFX::ClipPreferencesSetter &clipPreference
 {
     // set the fielding of dstClip_
     clipPreferences.setOutputFielding(OFX::eFieldNone);
+    bool doubleFramerate;
+    _doubleFramerate->getValue(doubleFramerate);
+    if (doubleFramerate) {
+        double frameRate = srcClip_->getFrameRate();
+        clipPreferences.setOutputFrameRate(2 * frameRate);
+    }
 }
 
 bool
@@ -580,6 +693,27 @@ DeinterlacePlugin::isIdentity(const OFX::IsIdentityArguments &args,
 {
     if (!kSupportsRenderScale && (args.renderScale.x != 1. || args.renderScale.y != 1.)) {
         OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+
+    return false;
+}
+
+/* override the time domain action, only for the general context */
+bool
+DeinterlacePlugin::getTimeDomain(OfxRangeD &range)
+{
+    // this should only be called in the general context, ever!
+    if (getContext() == OFX::eContextGeneral) {
+        bool doubleFramerate;
+        _doubleFramerate->getValue(doubleFramerate);
+        if (doubleFramerate) {
+            // how many frames on the input clip
+            OfxRangeD srcRange = srcClip_->getFrameRange();
+
+            range.min = srcRange.min * 2;
+            range.max = srcRange.max * 2;
+        }
+        return true;
     }
 
     return false;
@@ -668,25 +802,12 @@ void DeinterlacePluginFactory::describeInContext(OFX::ImageEffectDescriptor &des
         param->setLabels(kParamFieldOrderLabel, kParamFieldOrderLabel, kParamFieldOrderLabel);
         param->setHint(kParamFieldOrderHint);
         assert(param->getNOptions() == eFieldOrderLower);
-        param->appendOption(kParamFieldOrderOptionLower);
+        param->appendOption(kParamFieldOrderOptionLower, kParamFieldOrderOptionLowerHint);
         assert(param->getNOptions() == eFieldOrderUpper);
-        param->appendOption(kParamFieldOrderOptionUpper);
+        param->appendOption(kParamFieldOrderOptionUpper, kParamFieldOrderOptionUpperHint);
         assert(param->getNOptions() == eFieldOrderAuto);
-        param->appendOption(kParamFieldOrderOptionAuto);
+        param->appendOption(kParamFieldOrderOptionAuto, kParamFieldOrderOptionAutoHint);
         param->setDefault(int(eFieldOrderAuto));
-        param->setAnimates(true); // can animate
-        page->addChild(*param);
-    }
-
-    {
-        ChoiceParamDescriptor *param = desc.defineChoiceParam(kParamParity);
-        param->setLabels(kParamParityLabel, kParamParityLabel, kParamParityLabel);
-        param->setHint(kParamParityHint);
-        assert(param->getNOptions() == eParityLower);
-        param->appendOption(kParamParityOptionLower);
-        assert(param->getNOptions() == eParityUpper);
-        param->appendOption(kParamParityOptionUpper);
-        param->setDefault(int(eParityLower));
         param->setAnimates(true); // can animate
         page->addChild(*param);
     }
@@ -705,11 +826,24 @@ void DeinterlacePluginFactory::describeInContext(OFX::ImageEffectDescriptor &des
     }
 
     {
+        ChoiceParamDescriptor *param = desc.defineChoiceParam(kParamW3FFilter);
+        param->setLabels(kParamW3FFilterLabel, kParamW3FFilterLabel, kParamW3FFilterLabel);
+        param->setHint(kParamW3FFilterHint);
+        assert(param->getNOptions() == eW3FFilterSimple);
+        param->appendOption(kParamW3FFilterOptionSimple, kParamW3FFilterOptionSimpleHint);
+        assert(param->getNOptions() == eW3FFilterComplex);
+        param->appendOption(kParamW3FFilterOptionComplex, kParamW3FFilterOptionComplexHint);
+        param->setDefault(eYadifModeTemporalSpatial);
+        param->setAnimates(true); // can animate
+        param->setIsSecret(true); // Not yet implemented!
+        page->addChild(*param);
+    }
+
+    {
         BooleanParamDescriptor *param = desc.defineBooleanParam(kParamDoubleFramerate);
         param->setLabels(kParamDoubleFramerateLabel, kParamDoubleFramerateLabel, kParamDoubleFramerateLabel);
         param->setHint(kParamDoubleFramerateHint);
-        param->setIsSecret(true); // Not yet implemented!
-        page->addChild(*param);
+        param->setAnimates(false);
     }
 }
 
